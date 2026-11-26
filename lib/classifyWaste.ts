@@ -13,7 +13,7 @@ export interface ClassificationResult {
 }
 
 async function getCandidateModels(apiKey: string): Promise<string[]> {
-  const defaults = ["gemini-3.8-flash", "gemini-flash-latest"];
+  const defaults = ["gemini-3.5-flash", "gemini-flash-latest"];
 
   try {
     const res = await fetch(
@@ -35,7 +35,7 @@ async function getCandidateModels(apiKey: string): Promise<string[]> {
       .map((m: { name: string }) => m.name.replace(/^models\//, ""));
 
     return Array.from(
-      new Set(["gemini-3.8-flash", ...activeFlash.reverse(), ...defaults])
+      new Set(["gemini-3.5-flash", ...activeFlash.reverse(), ...defaults])
     );
   } catch {
     return defaults;
