@@ -12,12 +12,45 @@ export interface ClassificationResult {
   reason: string;
 }
 
+async function getAvailableFlashModels(apiKey: string): Promise<string[]> {
+  const preferred = [
+    "gemini-flash-latest",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+  ];
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
+    );
+    if (!res.ok) return preferred;
+
+    const json = await res.json();
+    const models: string[] = (json.models || [])
+      .filter(
+        (m: { name?: string; supportedGenerationMethods?: string[] }) =>
+          m.name?.includes("flash") &&
+          !m.name?.includes("embedding") &&
+          !m.name?.includes("tts") &&
+          !m.name?.includes("audio") &&
+          !m.name?.includes("image") &&
+          m.supportedGenerationMethods?.includes("generateContent")
+      )
+      .map((m: { name: string }) => m.name.replace(/^models\//, ""));
+
+    return Array.from(new Set([...models.reverse(), ...preferred]));
+  } catch {
+    return preferred;
+  }
+}
+
 export async function classifyAndTriggerSort(
   imageBase64: string,
   mimeType: string = "image/jpeg"
 ): Promise<ClassificationResult> {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("token ku habis kontol");
+  if (!apiKey) throw new Error("GEMINI_API_KEY belum diset");
 
   const prompt = `Kamu adalah AI pemilah sampah pintar EcoGenZ. Analisis gambar sampah ini dan tentukan apakah termasuk ORGANIK (sisa makanan, kulit buah, daun, tisu kotor/basah, tulang, ampas kopi) atau ANORGANIK (plastik, botol, kaleng, kertas bersih/kardus, kaca, styrofoam, logam, elektronik).
 Jawab HANYA dalam format JSON valid dengan skema:
@@ -28,41 +61,57 @@ Jawab HANYA dalam format JSON valid dengan skema:
   "reason": "alasan singkat 1 kalimat"
 }`;
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              { text: prompt },
-              {
-                inline_data: {
-                  mime_type: mimeType,
-                  data: imageBase64,
-                },
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          responseMimeType: "application/json",
-          temperature: 0.1,
-        },
-      }),
-    }
-  );
+  const candidateModels = await getAvailableFlashModels(apiKey);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let data: any = null;
+  let lastError = "";
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Gemini API Error: ${errText}`);
+  for (const model of candidateModels) {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: prompt },
+                {
+                  inline_data: {
+                    mime_type: mimeType,
+                    data: imageBase64,
+                  },
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.1,
+          },
+        }),
+      }
+    );
+
+    if (response.ok) {
+      data = await response.json();
+      break;
+    }
+
+    lastError = `[${model}] ${await response.text()}`;
+    if (response.status !== 404 && response.status !== 400) {
+      throw new Error(`Gemini API Error: ${lastError}`);
+    }
   }
 
-  const data = await response.json();
+  if (!data) {
+    throw new Error(`Semua model Gemini gagal: ${lastError}`);
+  }
+
   const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-  const parsed = JSON.parse(rawText);
+  const cleanedText = rawText.replace(/```json|```/g, "").trim();
+  const parsed = JSON.parse(cleanedText);
 
   const category: "ORGANIK" | "ANORGANIK" =
     parsed.category?.toUpperCase() === "ORGANIK" ? "ORGANIK" : "ANORGANIK";
