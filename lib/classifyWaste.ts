@@ -12,22 +12,17 @@ export interface ClassificationResult {
   reason: string;
 }
 
-async function getAvailableFlashModels(apiKey: string): Promise<string[]> {
-  const preferred = [
-    "gemini-flash-latest",
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-  ];
+async function getCandidateModels(apiKey: string): Promise<string[]> {
+  const defaults = ["gemini-3.8-flash", "gemini-flash-latest"];
 
   try {
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
     );
-    if (!res.ok) return preferred;
+    if (!res.ok) return defaults;
 
     const json = await res.json();
-    const models: string[] = (json.models || [])
+    const activeFlash: string[] = (json.models || [])
       .filter(
         (m: { name?: string; supportedGenerationMethods?: string[] }) =>
           m.name?.includes("flash") &&
@@ -39,9 +34,11 @@ async function getAvailableFlashModels(apiKey: string): Promise<string[]> {
       )
       .map((m: { name: string }) => m.name.replace(/^models\//, ""));
 
-    return Array.from(new Set([...models.reverse(), ...preferred]));
+    return Array.from(
+      new Set(["gemini-3.8-flash", ...activeFlash.reverse(), ...defaults])
+    );
   } catch {
-    return preferred;
+    return defaults;
   }
 }
 
@@ -61,12 +58,12 @@ Jawab HANYA dalam format JSON valid dengan skema:
   "reason": "alasan singkat 1 kalimat"
 }`;
 
-  const candidateModels = await getAvailableFlashModels(apiKey);
+  const models = await getCandidateModels(apiKey);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let data: any = null;
   let lastError = "";
 
-  for (const model of candidateModels) {
+  for (const model of models) {
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
       {
