@@ -1,218 +1,151 @@
-import { supabase } from "@/lib/supabase";
-import type {
-  DeviceState,
-  WasteCategory,
-  WasteClassificationResult,
-  WasteSortOutcome,
-} from "@/lib/types";
+import { createClient } from "@supabase/supabase-js";
 
-const GEMINI_ENDPOINT =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!
+);
 
-const CLASSIFICATION_PROMPT = [
-  "Kamu adalah sistem AI pemilah sampah EcoGenZ Smart Waste Sorter.",
-  "Analisis foto sampah pada nampan dan klasifikasikan secara ketat ke salah satu dari dua kategori saja:",
-  '- "ORGANIK": sisa makanan, kulit buah, sayuran, daun, ampas kopi/teh, bahan hayati yang mudah terurai.',
-  '- "ANORGANIK": plastik, botol, kaleng, kertas/kardus kemasan, kaca, styrofoam, logam, elektronik, atau benda non-organik lainnya.',
-  "",
-  "Balas HANYA dalam JSON valid sesuai skema:",
-  '- "category": wajib tepat "ORGANIK" atau "ANORGANIK"',
-  '- "item": nama benda dalam Bahasa Indonesia, maksimal 3 kata',
-  '- "confidence": angka bulat 0 sampai 100',
-  '- "reason": penjelasan singkat tepat 1 kalimat dalam Bahasa Indonesia',
-].join("\n");
-
-interface GeminiPart {
-  text?: string;
-  thought?: boolean;
+export interface ClassificationResult {
+  category: "ORGANIK" | "ANORGANIK";
+  item: string;
+  confidence: number;
+  reason: string;
 }
 
-interface GeminiResponse {
-  candidates?: Array<{
-    content?: {
-      parts?: GeminiPart[];
-    };
-  }>;
-}
+async function getFreeVisionModels(): Promise<string[]> {
+  const fallback = [
+    "google/gemma-3-27b-it:free",
+    "qwen/qwen2.5-vl-72b-instruct:free",
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+  ];
 
-function stripDataUrlPrefix(base64OrDataUrl: string): string {
-  const commaIdx = base64OrDataUrl.indexOf(",");
-  if (base64OrDataUrl.startsWith("data:") && commaIdx !== -1) {
-    return base64OrDataUrl.slice(commaIdx + 1).trim();
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/models");
+    if (!res.ok) return fallback;
+
+    const json = await res.json();
+    const freeVision: string[] = (json.data || [])
+      .filter(
+        (m: { id?: string; architecture?: { input_modalities?: string[] } }) =>
+          m.id?.endsWith(":free") &&
+          Array.isArray(m.architecture?.input_modalities) &&
+          m.architecture.input_modalities.includes("image")
+      )
+      .map((m: { id: string }) => m.id);
+
+    return freeVision.length > 0
+      ? Array.from(new Set([...freeVision, ...fallback]))
+      : fallback;
+  } catch {
+    return fallback;
   }
-  return base64OrDataUrl.trim();
 }
 
-function normalizeClassification(raw: unknown): WasteClassificationResult {
-  if (!raw || typeof raw !== "object") {
-    throw new Error("Gemini returned non-object JSON");
-  }
-
-  const obj = raw as Record<string, unknown>;
-  const rawCategory =
-    typeof obj.category === "string" ? obj.category.trim().toUpperCase() : "";
-
-  let category: WasteCategory;
-  if (rawCategory === "ORGANIK") {
-    category = "ORGANIK";
-  } else if (rawCategory === "ANORGANIK") {
-    category = "ANORGANIK";
-  } else {
-    throw new Error(`Invalid waste category from Gemini: "${rawCategory}"`);
-  }
-
-  const rawItem =
-    typeof obj.item === "string" ? obj.item.trim() : "Sampah Tidak Dikenal";
-  const words = rawItem.split(/\s+/).filter(Boolean).slice(0, 3);
-  const item = words.length > 0 ? words.join(" ") : "Sampah";
-
-  const parsedConfidence = Number(obj.confidence);
-  const confidence = Number.isFinite(parsedConfidence)
-    ? Math.max(0, Math.min(100, Math.round(parsedConfidence)))
-    : 80;
-
-  const reason =
-    typeof obj.reason === "string" && obj.reason.trim().length > 0
-      ? obj.reason.trim()
-      : `Benda diklasifikasikan sebagai sampah ${category.toLowerCase()}.`;
-
-  return {
-    category,
-    item,
-    confidence,
-    reason,
-  };
-}
-
-/**
- * Classifies a waste photo using Gemini 2.5 Flash Vision and triggers servo sorting
- * by updating row id = 1 in Supabase `device_state`.
- */
 export async function classifyAndTriggerSort(
   imageBase64: string,
-  mimeType: string
-): Promise<WasteSortOutcome> {
-  const apiKey = process.env.GEMINI_API_KEY;
+  mimeType: string = "image/jpeg"
+): Promise<ClassificationResult> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
-    throw new Error("Missing GEMINI_API_KEY environment variable.");
+    throw new Error("OPENROUTER_API_KEY belum diset di Environment Variables Vercel");
   }
 
-  const cleanBase64 = stripDataUrlPrefix(imageBase64);
-  if (!cleanBase64) {
-    throw new Error("Empty imageBase64 payload.");
-  }
+  const match = imageBase64.match(/^data:(image\/[\w+.-]+);base64,(.+)$/);
+  const cleanMime = match ? match[1] : mimeType || "image/jpeg";
+  const cleanBase64 = match ? match[2] : imageBase64;
 
-  const normalizedMimeType =
-    typeof mimeType === "string" && mimeType.startsWith("image/")
-      ? mimeType
-      : "image/jpeg";
+  const prompt = `Kamu adalah AI pemilah sampah pintar EcoGenZ. Analisis gambar sampah ini dan tentukan apakah termasuk ORGANIK (sisa makanan, kulit buah, daun, tisu kotor/basah, tulang, ampas kopi) atau ANORGANIK (plastik, botol, kaleng, kertas bersih/kardus, kaca, styrofoam, logam, elektronik).
+Balas HANYA dengan JSON valid tanpa teks tambahan:
+{
+  "category": "ORGANIK" atau "ANORGANIK",
+  "item": "nama singkat benda dalam Bahasa Indonesia (maks 3 kata)",
+  "confidence": angka 0-100,
+  "reason": "alasan singkat 1 kalimat"
+}`;
 
-  const geminiResponse = await fetch(GEMINI_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
-    body: JSON.stringify({
-      contents: [
-        {
-          parts: [
-            { text: CLASSIFICATION_PROMPT },
+  const models = await getFreeVisionModels();
+  let rawText = "";
+  let lastError = "";
+
+  for (const model of models.slice(0, 6)) {
+    const response = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://ecogenz.vercel.app",
+          "X-Title": "EcoGenZ",
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.1,
+          messages: [
             {
-              inline_data: {
-                mime_type: normalizedMimeType,
-                data: cleanBase64,
-              },
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
+                {
+                  type: "image_url",
+                  image_url: {
+                    url: `data:${cleanMime};base64,${cleanBase64}`,
+                  },
+                },
+              ],
             },
           ],
-        },
-      ],
-      generationConfig: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: "OBJECT",
-          properties: {
-            category: {
-              type: "STRING",
-              enum: ["ORGANIK", "ANORGANIK"],
-            },
-            item: { type: "STRING" },
-            confidence: { type: "INTEGER" },
-            reason: { type: "STRING" },
-          },
-          required: ["category", "item", "confidence", "reason"],
-        },
-        temperature: 0.2,
-      },
-    }),
-    cache: "no-store",
-  });
-
-  if (!geminiResponse.ok) {
-    const errorText = await geminiResponse.text();
-    throw new Error(
-      `Gemini API error (${geminiResponse.status}): ${errorText}`
+        }),
+      }
     );
-  }
 
-  const geminiData = (await geminiResponse.json()) as GeminiResponse;
-  const parts = geminiData.candidates?.[0]?.content?.parts ?? [];
-  const rawText =
-    parts.find((part) => !part.thought && typeof part.text === "string")
-      ?.text ?? parts[0]?.text;
+    if (response.ok) {
+      const data = await response.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (content) {
+        rawText = content;
+        break;
+      }
+    }
+
+    lastError = `[${model}] (${response.status}): ${await response.text()}`;
+  }
 
   if (!rawText) {
-    throw new Error("Gemini API returned empty candidate text.");
+    throw new Error(`OpenRouter Vision gagal: ${lastError}`);
   }
 
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(rawText);
-  } catch {
-    throw new Error(`Failed to parse Gemini JSON response: ${rawText}`);
-  }
+  const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+  const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : "{}");
 
-  const classification = normalizeClassification(parsedJson);
+  const category: "ORGANIK" | "ANORGANIK" =
+    parsed.category?.toUpperCase() === "ORGANIK" ? "ORGANIK" : "ANORGANIK";
+  const item = parsed.item || "Sampah Tidak Dikenal";
+  const confidence = Number(parsed.confidence) || 85;
+  const reason = parsed.reason || "-";
 
-  const { data: currentState, error: fetchError } = await supabase
+  const { data: current } = await supabase
     .from("device_state")
     .select("organik_count, anorganik_count")
     .eq("id", 1)
-    .maybeSingle<Pick<DeviceState, "organik_count" | "anorganik_count">>();
+    .single();
 
-  if (fetchError) {
-    throw new Error(
-      `Failed to fetch device_state counters: ${fetchError.message}`
-    );
-  }
+  const organikCount =
+    (current?.organik_count || 0) + (category === "ORGANIK" ? 1 : 0);
+  const anorganikCount =
+    (current?.anorganik_count || 0) + (category === "ANORGANIK" ? 1 : 0);
 
-  const nextOrganikCount =
-    (currentState?.organik_count ?? 0) +
-    (classification.category === "ORGANIK" ? 1 : 0);
-  const nextAnorganikCount =
-    (currentState?.anorganik_count ?? 0) +
-    (classification.category === "ANORGANIK" ? 1 : 0);
-
-  const { error: updateError } = await supabase
+  await supabase
     .from("device_state")
     .update({
-      sort_command: classification.category,
-      last_item: classification.item,
-      last_category: classification.category,
-      organik_count: nextOrganikCount,
-      anorganik_count: nextAnorganikCount,
+      sort_command: category,
+      last_item: item,
+      last_category: category,
+      organik_count: organikCount,
+      anorganik_count: anorganikCount,
+      updated_at: new Date().toISOString(),
     })
     .eq("id", 1);
 
-  if (updateError) {
-    throw new Error(
-      `Failed to update device_state for sort trigger: ${updateError.message}`
-    );
-  }
-
-  return {
-    ...classification,
-    organik_count: nextOrganikCount,
-    anorganik_count: nextAnorganikCount,
-  };
+  return { category, item, confidence, reason };
 }
