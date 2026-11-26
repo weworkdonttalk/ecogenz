@@ -12,33 +12,32 @@ export interface ClassificationResult {
   reason: string;
 }
 
-async function getCandidateModels(apiKey: string): Promise<string[]> {
-  const defaults = ["gemini-3.5-flash", "gemini-flash-latest"];
+async function getFreeVisionModels(): Promise<string[]> {
+  const fallback = [
+    "google/gemma-3-27b-it:free",
+    "qwen/qwen2.5-vl-72b-instruct:free",
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+  ];
 
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`
-    );
-    if (!res.ok) return defaults;
+    const res = await fetch("https://openrouter.ai/api/v1/models");
+    if (!res.ok) return fallback;
 
     const json = await res.json();
-    const activeFlash: string[] = (json.models || [])
+    const freeVision: string[] = (json.data || [])
       .filter(
-        (m: { name?: string; supportedGenerationMethods?: string[] }) =>
-          m.name?.includes("flash") &&
-          !m.name?.includes("embedding") &&
-          !m.name?.includes("tts") &&
-          !m.name?.includes("audio") &&
-          !m.name?.includes("image") &&
-          m.supportedGenerationMethods?.includes("generateContent")
+        (m: { id?: string; architecture?: { input_modalities?: string[] } }) =>
+          m.id?.endsWith(":free") &&
+          Array.isArray(m.architecture?.input_modalities) &&
+          m.architecture.input_modalities.includes("image")
       )
-      .map((m: { name: string }) => m.name.replace(/^models\//, ""));
+      .map((m: { id: string }) => m.id);
 
-    return Array.from(
-      new Set(["gemini-3.5-flash", ...activeFlash.reverse(), ...defaults])
-    );
+    return freeVision.length > 0
+      ? Array.from(new Set([...freeVision, ...fallback]))
+      : fallback;
   } catch {
-    return defaults;
+    return fallback;
   }
 }
 
@@ -46,11 +45,13 @@ export async function classifyAndTriggerSort(
   imageBase64: string,
   mimeType: string = "image/jpeg"
 ): Promise<ClassificationResult> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("GEMINI_API_KEY belum diset");
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    throw new Error("OPENROUTER_API_KEY belum terbaca di server");
+  }
 
   const prompt = `Kamu adalah AI pemilah sampah pintar EcoGenZ. Analisis gambar sampah ini dan tentukan apakah termasuk ORGANIK (sisa makanan, kulit buah, daun, tisu kotor/basah, tulang, ampas kopi) atau ANORGANIK (plastik, botol, kaleng, kertas bersih/kardus, kaca, styrofoam, logam, elektronik).
-Jawab HANYA dalam format JSON valid dengan skema:
+Balas HANYA dengan JSON valid tanpa teks tambahan:
 {
   "category": "ORGANIK" atau "ANORGANIK",
   "item": "nama singkat benda dalam Bahasa Indonesia (maks 3 kata)",
@@ -58,57 +59,60 @@ Jawab HANYA dalam format JSON valid dengan skema:
   "reason": "alasan singkat 1 kalimat"
 }`;
 
-  const models = await getCandidateModels(apiKey);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let data: any = null;
+  const models = await getFreeVisionModels();
+  let rawText = "";
   let lastError = "";
 
-  for (const model of models) {
+  for (const model of models.slice(0, 6)) {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      "https://openrouter.ai/api/v1/chat/completions",
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://ecogenz.vercel.app",
+          "X-Title": "EcoGenZ",
+        },
         body: JSON.stringify({
-          contents: [
+          model,
+          temperature: 0.1,
+          messages: [
             {
-              parts: [
-                { text: prompt },
+              role: "user",
+              content: [
+                { type: "text", text: prompt },
                 {
-                  inline_data: {
-                    mime_type: mimeType,
-                    data: imageBase64,
+                  type: "image_url",
+                  image_url: {
+                    url: `data:${mimeType};base64,${imageBase64}`,
                   },
                 },
               ],
             },
           ],
-          generationConfig: {
-            responseMimeType: "application/json",
-            temperature: 0.1,
-          },
         }),
       }
     );
 
     if (response.ok) {
-      data = await response.json();
-      break;
+      const data = await response.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (content) {
+        rawText = content;
+        break;
+      }
     }
 
-    lastError = `[${model}] ${await response.text()}`;
-    if (response.status !== 404 && response.status !== 400) {
-      throw new Error(`Gemini API Error: ${lastError}`);
-    }
+    lastError = `[${model}] (${response.status}): ${await response.text()}`;
   }
 
-  if (!data) {
-    throw new Error(`Semua model Gemini gagal: ${lastError}`);
+  if (!rawText) {
+    throw new Error(`Semua model Vision OpenRouter gagal: ${lastError}`);
   }
 
-  const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-  const cleanedText = rawText.replace(/```json|```/g, "").trim();
-  const parsed = JSON.parse(cleanedText);
+  const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+  const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : "{}");
 
   const category: "ORGANIK" | "ANORGANIK" =
     parsed.category?.toUpperCase() === "ORGANIK" ? "ORGANIK" : "ANORGANIK";
