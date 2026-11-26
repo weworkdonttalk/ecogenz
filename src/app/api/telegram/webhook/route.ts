@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
+import { classifyAndTriggerSort } from "@/lib/classifyWaste";
 import { supabase } from "@/lib/supabase";
-import { sendTelegramMessage } from "@/lib/telegram";
+import {
+  escapeTelegramHtml,
+  formatClassificationTelegramMessage,
+  sendTelegramMessage,
+} from "@/lib/telegram";
 import {
   getGasStatusInfo,
   isDeviceOnline,
@@ -8,12 +13,27 @@ import {
   type DeviceState,
 } from "@/lib/types";
 
+interface TelegramPhotoSize {
+  file_id: string;
+  width?: number;
+  height?: number;
+  file_size?: number;
+}
+
 interface TelegramUpdate {
   message?: {
     chat?: {
       id: number | string;
     };
     text?: string;
+    photo?: TelegramPhotoSize[];
+  };
+}
+
+interface TelegramGetFileResponse {
+  ok: boolean;
+  result?: {
+    file_path?: string;
   };
 }
 
@@ -38,6 +58,78 @@ const MODE_COMMANDS: Record<
   },
 };
 
+function inferImageMimeType(filePath: string): string {
+  const lower = filePath.toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".webp")) return "image/webp";
+  return "image/jpeg";
+}
+
+function pickLargestPhoto(photos: TelegramPhotoSize[]): TelegramPhotoSize {
+  return photos.reduce((largest, current) => {
+    const largestScore =
+      largest.file_size ?? (largest.width ?? 0) * (largest.height ?? 0);
+    const currentScore =
+      current.file_size ?? (current.width ?? 0) * (current.height ?? 0);
+    return currentScore >= largestScore ? current : largest;
+  }, photos[0]);
+}
+
+async function handlePhotoMessage(
+  photos: TelegramPhotoSize[],
+  chatId: number | string
+) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    console.error("[telegram/webhook] Missing TELEGRAM_BOT_TOKEN");
+    return;
+  }
+
+  try {
+    const largestPhoto = pickLargestPhoto(photos);
+    const fileInfoRes = await fetch(
+      `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(
+        largestPhoto.file_id
+      )}`,
+      { cache: "no-store" }
+    );
+
+    if (!fileInfoRes.ok) {
+      throw new Error(`getFile failed with status ${fileInfoRes.status}`);
+    }
+
+    const fileInfo = (await fileInfoRes.json()) as TelegramGetFileResponse;
+    const filePath = fileInfo.result?.file_path;
+    if (!fileInfo.ok || !filePath) {
+      throw new Error("Telegram getFile did not return a file_path");
+    }
+
+    const downloadRes = await fetch(
+      `https://api.telegram.org/file/bot${token}/${filePath}`,
+      { cache: "no-store" }
+    );
+
+    if (!downloadRes.ok) {
+      throw new Error(`File download failed with status ${downloadRes.status}`);
+    }
+
+    const arrayBuffer = await downloadRes.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString("base64");
+    const mimeType = inferImageMimeType(filePath);
+
+    const outcome = await classifyAndTriggerSort(base64, mimeType);
+    const reply = formatClassificationTelegramMessage(outcome, "Foto Telegram");
+    await sendTelegramMessage(reply, chatId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error("[telegram/webhook] Photo classification error:", message);
+    await sendTelegramMessage(
+      "❌ Gagal memproses foto sampah dengan Gemini Vision. Coba kirim ulang foto yang lebih jelas.",
+      chatId
+    );
+  }
+}
+
 async function handleStatusCommand(chatId: number | string) {
   const { data: state, error } = await supabase
     .from("device_state")
@@ -55,13 +147,22 @@ async function handleStatusCommand(chatId: number | string) {
 
   const online = isDeviceOnline(state.updated_at);
   const gasInfo = getGasStatusInfo(state.gas_level);
+  const trayStatus = state.trash_detected
+    ? "📦 Sampah Terdeteksi — Siap Difoto"
+    : "✨ Nampan Kosong";
+  const lastItemText = state.last_item
+    ? `${escapeTelegramHtml(state.last_item)} (${state.last_category ?? "-"})`
+    : "-";
 
   const reply = [
     "<b>🗑️ Status EcoGenZ Smart Trash</b>",
     "",
     `• <b>Koneksi:</b> ${online ? "🟢 Online" : "⚫ Offline"}`,
+    `• <b>Status Nampan:</b> ${trayStatus}`,
+    `• <b>Item Terakhir:</b> ${lastItemText}`,
+    `• <b>Counter Pemilahan:</b> 🌿 Organik <b>${state.organik_count ?? 0}</b> | ♻️ Anorganik <b>${state.anorganik_count ?? 0}</b>`,
     `• <b>Mode Kontrol:</b> <code>${state.control_mode}</code>`,
-    `• <b>Status Tutup:</b> ${state.lid_status}`,
+    `• <b>Status Tutup:</b> ${escapeTelegramHtml(state.lid_status)}`,
     `• <b>Gas MQ-2:</b> ${state.gas_level} (${gasInfo.category})`,
     `• <b>Suhu:</b> ${Number(state.temperature).toFixed(1)} °C`,
     `• <b>Kelembapan:</b> ${Number(state.humidity).toFixed(1)} %`,
@@ -109,9 +210,18 @@ export async function POST(request: NextRequest) {
   }
 
   const chatId = update.message?.chat?.id;
-  const text = update.message?.text;
+  if (!chatId) {
+    return NextResponse.json({ ok: true });
+  }
 
-  if (!chatId || !text) {
+  const photos = update.message?.photo;
+  if (Array.isArray(photos) && photos.length > 0) {
+    await handlePhotoMessage(photos, chatId);
+    return NextResponse.json({ ok: true });
+  }
+
+  const text = update.message?.text;
+  if (!text) {
     return NextResponse.json({ ok: true });
   }
 
@@ -124,10 +234,11 @@ export async function POST(request: NextRequest) {
   } else if (command === "/start" || command === "/help") {
     await sendTelegramMessage(
       [
-        "<b>🤖 EcoGenZ Smart Trash Bot</b>",
+        "<b>🤖 EcoGenZ Smart Waste Sorter Bot</b>",
         "",
         "Perintah yang tersedia:",
-        "• /status — Cek kondisi terkini tong sampah",
+        "• Kirim <b>Foto Sampah</b> — Deteksi Gemini AI & pilah servo otomatis",
+        "• /status — Cek kondisi terkini tong, nampan & counter",
         "• /buka — Buka tutup tong secara paksa",
         "• /tutup — Tutup tong secara paksa",
         "• /auto — Kembali ke mode sensor otomatis",

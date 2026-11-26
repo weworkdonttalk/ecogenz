@@ -1,10 +1,24 @@
 export type ControlMode = "AUTO" | "FORCE_OPEN" | "FORCE_CLOSE";
+export type WasteCategory = "ORGANIK" | "ANORGANIK";
+export type SortCommand = "NONE" | WasteCategory;
 
 export const VALID_CONTROL_MODES: readonly ControlMode[] = [
   "AUTO",
   "FORCE_OPEN",
   "FORCE_CLOSE",
 ] as const;
+
+export interface WasteClassificationResult {
+  category: WasteCategory;
+  item: string;
+  confidence: number;
+  reason: string;
+}
+
+export interface WasteSortOutcome extends WasteClassificationResult {
+  organik_count: number;
+  anorganik_count: number;
+}
 
 export interface DeviceState {
   id: number;
@@ -17,6 +31,12 @@ export interface DeviceState {
   open_count: number;
   last_alert_at: string | null;
   updated_at: string;
+  sort_command?: SortCommand;
+  trash_detected?: boolean;
+  last_item?: string | null;
+  last_category?: WasteCategory | null;
+  organik_count?: number;
+  anorganik_count?: number;
 }
 
 export interface DashboardState extends DeviceState {

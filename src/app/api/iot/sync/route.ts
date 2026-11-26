@@ -5,6 +5,7 @@ import {
   GAS_DANGER_THRESHOLD,
   type ControlMode,
   type DeviceState,
+  type SortCommand,
 } from "@/lib/types";
 
 const ALERT_COOLDOWN_MS = 5 * 60 * 1000;
@@ -17,6 +18,14 @@ interface SyncPayload {
   distance_cm: number;
   lid_status: string;
   opened_now: boolean;
+  trash_detected: boolean;
+  sort_done: boolean;
+}
+
+function parseBooleanField(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") return value.trim().toLowerCase() === "true";
+  return Boolean(value);
 }
 
 function parseSyncPayload(body: unknown): SyncPayload | null {
@@ -29,7 +38,9 @@ function parseSyncPayload(body: unknown): SyncPayload | null {
   const distanceCm = Number(data.distance_cm);
   const lidStatus =
     typeof data.lid_status === "string" ? data.lid_status.trim() : "";
-  const openedNow = Boolean(data.opened_now);
+  const openedNow = parseBooleanField(data.opened_now);
+  const trashDetected = parseBooleanField(data.trash_detected);
+  const sortDone = parseBooleanField(data.sort_done);
 
   if (
     !Number.isFinite(temperature) ||
@@ -48,6 +59,8 @@ function parseSyncPayload(body: unknown): SyncPayload | null {
     distance_cm: distanceCm,
     lid_status: lidStatus,
     opened_now: openedNow,
+    trash_detected: trashDetected,
+    sort_done: sortDone,
   };
 }
 
@@ -71,7 +84,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(
       {
         error:
-          "Invalid payload. Expected temperature, humidity, gas_level, distance_cm, lid_status, and opened_now.",
+          "Invalid payload. Expected temperature, humidity, gas_level, distance_cm, lid_status, opened_now, trash_detected, and sort_done.",
       },
       { status: 400 }
     );
@@ -97,6 +110,9 @@ export async function POST(request: NextRequest) {
   const currentOpenCount = currentState?.open_count ?? 0;
   const nextOpenCount = currentOpenCount + (payload.opened_now ? 1 : 0);
   const controlMode: ControlMode = currentState?.control_mode ?? "AUTO";
+  const nextSortCommand: SortCommand = payload.sort_done
+    ? "NONE"
+    : (currentState?.sort_command ?? "NONE");
 
   const lastAlertMs = currentState?.last_alert_at
     ? new Date(currentState.last_alert_at).getTime()
@@ -133,6 +149,8 @@ export async function POST(request: NextRequest) {
     control_mode: controlMode,
     open_count: nextOpenCount,
     last_alert_at: nextLastAlertAt,
+    trash_detected: payload.trash_detected,
+    sort_command: nextSortCommand,
     updated_at: nowIso,
   };
 
@@ -190,5 +208,9 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  return NextResponse.json({ ok: true, mode: controlMode });
+  return NextResponse.json({
+    ok: true,
+    mode: controlMode,
+    sort_command: nextSortCommand,
+  });
 }

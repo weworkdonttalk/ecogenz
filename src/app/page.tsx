@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import WasteScanner from "@/components/WasteScanner";
 import {
   GAS_DANGER_THRESHOLD,
   GAS_SMELLY_THRESHOLD,
@@ -468,6 +469,17 @@ export default function HomePage() {
             })}
           </div>
         </section>
+
+        {/* Gemini Vision Smart Waste Scanner */}
+        <WasteScanner
+          trashDetected={Boolean(state?.trash_detected)}
+          lastItem={state?.last_item ?? null}
+          lastCategory={state?.last_category ?? null}
+          organikCount={state?.organik_count ?? 0}
+          anorganikCount={state?.anorganik_count ?? 0}
+          sortCommand={state?.sort_command ?? "NONE"}
+          onClassified={() => void fetchDashboard()}
+        />
 
         {/* Cartoon Mascot & Quick Lid + Counter Card */}
         <section className="grid grid-cols-1 gap-4 rounded-[28px] border-2 border-black bg-[#F9A8D4] p-5 shadow-[4px_4px_0px_#000]">
