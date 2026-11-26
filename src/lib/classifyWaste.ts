@@ -10,6 +10,8 @@ export interface ClassificationResult {
   item: string;
   confidence: number;
   reason: string;
+  organik_count: number;
+  anorganik_count: number;
 }
 
 async function getFreeVisionModels(): Promise<string[]> {
@@ -147,5 +149,12 @@ Balas HANYA dengan JSON valid tanpa teks tambahan:
     })
     .eq("id", 1);
 
-  return { category, item, confidence, reason };
+  return {
+    category,
+    item,
+    confidence,
+    reason,
+    organik_count: organikCount,
+    anorganik_count: anorganikCount,
+  };
 }
